@@ -88,8 +88,15 @@ jobs:
       
       - name: Generate manifest
         run: |
+          echo "Current directory: $(pwd)"
+          echo "Listing files:"
+          ls -la
+          echo ""
+          echo "Checking images directory:"
+          ls -la ./images/ | head -20
+          echo ""
           echo "Generating manifest.yaml..."
-          ruby generate_manifest.rb images manifest.yaml
+          ruby ./generate_manifest.rb ./images ./manifest.yaml
       
       - name: Verify manifest
         run: |
@@ -106,7 +113,18 @@ jobs:
       - name: Check for changes
         id: check_changes
         run: |
-          if git diff --quiet manifest.yaml; then
+          # Check if manifest.yaml exists in the repository
+          if [ ! -f manifest.yaml ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "New manifest.yaml created"
+            exit 0
+          fi
+          
+          # Stage the newly generated manifest to compare
+          git add manifest.yaml
+          
+          # Check if there are changes
+          if git diff --cached --quiet manifest.yaml; then
             echo "changed=false" >> $GITHUB_OUTPUT
             echo "No changes to manifest.yaml"
           else
@@ -115,7 +133,7 @@ jobs:
             
             # Show the diff
             echo "Changes:"
-            git diff manifest.yaml | head -50
+            git diff --cached manifest.yaml | head -50
           fi
       
       - name: Generate commit message
