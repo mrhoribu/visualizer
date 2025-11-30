@@ -15,7 +15,7 @@ A Lich5 script that displays room images in a GTK window as you move through Gem
 
 ### 1. Install the Script
 
-Place `visualizer.rb` in your Lich scripts directory.
+Place `visualizer.lic` in your Lich scripts directory.
 
 ### 2. Add to Autostart (Optional)
 
@@ -95,7 +95,7 @@ your-repo/
 
 ### Updating the Repository URL
 
-In `visualizer.rb`, update these constants:
+In `visualizer.lic`, update these constants:
 
 ```ruby
 GITHUB_REPO = 'your-username/visualizer-assets'
