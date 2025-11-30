@@ -1,245 +1,105 @@
-name: Update and Validate Image Manifest
+#!/usr/bin/env ruby
+# frozen_string_literal: true
 
-on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'images/**/*.png'
-  workflow_dispatch:  # Allow manual trigger
-
-permissions:
-  contents: write
-  pull-requests: write
-
-jobs:
-  update-manifest:
-    runs-on: ubuntu-latest
+=begin
+  Manifest Generator for Visualizer Assets
+  
+  This script scans a directory of PNG images and generates a manifest.yaml
+  file with SHA256 checksums for each image.
+  
+  Usage:
+    ruby generate_manifest.rb [image_directory] [output_file]
     
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      
-      - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.2'
-      
-      - name: Install dependencies
-        run: |
-          gem install mini_magick
-      
-      - name: Validate images
-        id: validate
-        run: |
-          echo "## Image Validation Report" > validation_report.md
-          echo "" >> validation_report.md
-          
-          ERRORS=0
-          WARNINGS=0
-          
-          for img in images/*.png; do
-            if [ ! -f "$img" ]; then
-              continue
-            fi
-            
-            filename=$(basename "$img")
-            
-            # Check file size
-            size=$(stat -f%z "$img" 2>/dev/null || stat -c%s "$img" 2>/dev/null)
-            
-            if [ $size -gt 5242880 ]; then  # 5MB
-              echo "⚠️ **Warning**: \`$filename\` is larger than 5MB ($((size / 1024 / 1024))MB)" >> validation_report.md
-              WARNINGS=$((WARNINGS + 1))
-            fi
-            
-            # Check if it's a valid PNG
-            if ! file "$img" | grep -q "PNG image data"; then
-              echo "❌ **Error**: \`$filename\` is not a valid PNG file" >> validation_report.md
-              ERRORS=$((ERRORS + 1))
-            fi
-          done
-          
-          echo "" >> validation_report.md
-          echo "**Summary**: $ERRORS error(s), $WARNINGS warning(s)" >> validation_report.md
-          
-          cat validation_report.md
-          
-          echo "errors=$ERRORS" >> $GITHUB_OUTPUT
-          echo "warnings=$WARNINGS" >> $GITHUB_OUTPUT
-      
-      - name: Count images
-        id: count
-        run: |
-          TOTAL=$(find images -name "*.png" -type f | wc -l)
-          ROOM_UIDS=$(find images -name "u*.png" -type f | wc -l)
-          LOCATIONS=$(find images -name "*.png" -type f ! -name "u*.png" ! -name "null.png" | wc -l)
-          
-          echo "total=$TOTAL" >> $GITHUB_OUTPUT
-          echo "room_uids=$ROOM_UIDS" >> $GITHUB_OUTPUT
-          echo "locations=$LOCATIONS" >> $GITHUB_OUTPUT
-          
-          echo "📊 Image Statistics:"
-          echo "  - Total images: $TOTAL"
-          echo "  - Room UID images: $ROOM_UIDS"
-          echo "  - Location images: $LOCATIONS"
-      
-      - name: Generate manifest
-        run: |
-          echo "Generating manifest.yaml..."
-          ruby generate_manifest.rb images manifest.yaml
-      
-      - name: Verify manifest
-        run: |
-          if [ ! -f manifest.yaml ]; then
-            echo "❌ Error: manifest.yaml was not generated"
-            exit 1
-          fi
-          
-          # Check if manifest is valid YAML
-          ruby -r yaml -e "YAML.load_file('manifest.yaml')" || exit 1
-          
-          echo "✅ Manifest is valid YAML"
-      
-      - name: Check for changes
-        id: check_changes
-        run: |
-          # Check if manifest.yaml exists in the repository
-          if [ ! -f manifest.yaml ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "New manifest.yaml created"
-            exit 0
-          fi
-          
-          # Stage the newly generated manifest to compare
-          git add manifest.yaml
-          
-          # Check if there are changes
-          if git diff --cached --quiet manifest.yaml; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "No changes to manifest.yaml"
-          else
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "Manifest has been updated"
-            
-            # Show the diff
-            echo "Changes:"
-            git diff --cached manifest.yaml | head -50
-          fi
-      
-      - name: Generate commit message
-        if: steps.check_changes.outputs.changed == 'true'
-        id: commit_msg
-        run: |
-          # Get list of changed, added, and deleted images
-          ADDED=$(git diff --name-only --diff-filter=A HEAD~1 HEAD -- images/ | sed 's|images/||' | wc -l)
-          MODIFIED=$(git diff --name-only --diff-filter=M HEAD~1 HEAD -- images/ | sed 's|images/||' | wc -l)
-          DELETED=$(git diff --name-only --diff-filter=D HEAD~1 HEAD -- images/ | sed 's|images/||' | wc -l)
-          
-          CHANGED_IMAGES=$(git diff --name-only HEAD~1 HEAD -- images/ | sed 's|images/||' | head -10)
-          
-          # Build commit message using echo to handle multiline properly
-          echo "chore: update manifest.yaml" > commit_message.txt
-          echo "" >> commit_message.txt
-          echo "Image changes:" >> commit_message.txt
-          echo "- Added: $ADDED" >> commit_message.txt
-          echo "- Modified: $MODIFIED" >> commit_message.txt
-          echo "- Deleted: $DELETED" >> commit_message.txt
-          echo "- Total images: ${{ steps.count.outputs.total }}" >> commit_message.txt
-          echo "" >> commit_message.txt
-          echo "Files changed:" >> commit_message.txt
-          
-          # Add changed files to commit message
-          echo "$CHANGED_IMAGES" | while read -r file; do
-            if [ ! -z "$file" ]; then
-              echo "- $file" >> commit_message.txt
-            fi
-          done
-      
-      - name: Commit and push changes
-        if: steps.check_changes.outputs.changed == 'true' && github.event_name == 'push'
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add manifest.yaml
-          
-          if [ -f commit_message.txt ]; then
-            git commit -F commit_message.txt
-          else
-            git commit -m "chore: update manifest.yaml"
-          fi
-          
-          git push
-      
-      - name: Comment on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const total = '${{ steps.count.outputs.total }}';
-            const roomUids = '${{ steps.count.outputs.room_uids }}';
-            const locations = '${{ steps.count.outputs.locations }}';
-            const errors = parseInt('${{ steps.validate.outputs.errors }}');
-            const warnings = parseInt('${{ steps.validate.outputs.warnings }}');
-            const changed = '${{ steps.check_changes.outputs.changed }}';
-            
-            let comment = '## 🖼️ Image Manifest Update\n\n';
-            comment += '### Statistics\n';
-            comment += `- **Total images**: ${total}\n`;
-            comment += `- **Room UID images**: ${roomUids}\n`;
-            comment += `- **Location images**: ${locations}\n\n`;
-            
-            if (errors > 0 || warnings > 0) {
-              if (fs.existsSync('validation_report.md')) {
-                comment += fs.readFileSync('validation_report.md', 'utf8');
-                comment += '\n\n';
-              }
-            }
-            
-            if (changed === 'true') {
-              comment += '✅ Manifest will be automatically updated when this PR is merged.\n';
-            } else {
-              comment += 'ℹ️ No manifest changes needed.\n';
-            }
-            
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
-      
-      - name: Upload manifest artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: manifest
-          path: manifest.yaml
-          retention-days: 30
-      
-      - name: Job summary
-        if: always()
-        run: |
-          echo "## 📋 Manifest Update Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Image Statistics" >> $GITHUB_STEP_SUMMARY
-          echo "- **Total images**: ${{ steps.count.outputs.total }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Room UID images**: ${{ steps.count.outputs.room_uids }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Location images**: ${{ steps.count.outputs.locations }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ -f validation_report.md ]; then
-            cat validation_report.md >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          if [ "${{ steps.check_changes.outputs.changed }}" == "true" ]; then
-            echo "### ✅ Manifest Updated" >> $GITHUB_STEP_SUMMARY
-            echo "The manifest.yaml file has been updated and committed." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "### ℹ️ No Changes" >> $GITHUB_STEP_SUMMARY
-            echo "No changes to manifest.yaml were needed." >> $GITHUB_STEP_SUMMARY
-          fi
+  Example:
+    ruby generate_manifest.rb ./images manifest.yaml
+=end
+
+require 'digest'
+require 'yaml'
+
+def calculate_checksum(file_path)
+  Digest::SHA256.file(file_path).hexdigest
+end
+
+def get_file_size(file_path)
+  File.size(file_path)
+end
+
+def generate_manifest(image_dir, output_file)
+  unless Dir.exist?(image_dir)
+    puts "Error: Directory '#{image_dir}' does not exist"
+    exit 1
+  end
+
+  png_files = Dir.glob(File.join(image_dir, '*.png')).sort
+  
+  if png_files.empty?
+    puts "Error: No PNG files found in '#{image_dir}'"
+    exit 1
+  end
+
+  puts "Found #{png_files.size} PNG files"
+  puts "Generating checksums..."
+  
+  manifest = {}
+  
+  png_files.each_with_index do |file_path, index|
+    filename = File.basename(file_path)
+    print "  [#{index + 1}/#{png_files.size}] Processing #{filename}..."
+    
+    checksum = calculate_checksum(file_path)
+    size = get_file_size(file_path)
+    
+    manifest[filename] = {
+      'checksum' => checksum,
+      'size' => size,
+      'description' => generate_description(filename)
+    }
+    
+    puts " ✓"
+  end
+  
+  # Write manifest
+  File.write(output_file, YAML.dump(manifest))
+  puts "\nManifest written to: #{output_file}"
+  puts "Total files: #{manifest.size}"
+  
+  # Display summary
+  total_size = manifest.values.sum { |data| data['size'] }
+  puts "Total size: #{format_bytes(total_size)}"
+end
+
+def generate_description(filename)
+  case filename
+  when /^u(\d+)\.png$/
+    "Room UID #{Regexp.last_match(1)} image"
+  when 'null.png'
+    "Fallback image when room image not found"
+  else
+    "Location image: #{filename.gsub('.png', '')}"
+  end
+end
+
+def format_bytes(bytes)
+  if bytes < 1024
+    "#{bytes} B"
+  elsif bytes < 1024 * 1024
+    "#{(bytes / 1024.0).round(2)} KB"
+  else
+    "#{(bytes / (1024.0 * 1024.0)).round(2)} MB"
+  end
+end
+
+# Parse command line arguments
+image_dir = ARGV[0] || './images'
+output_file = ARGV[1] || 'manifest.yaml'
+
+puts "Visualizer Manifest Generator"
+puts "=" * 50
+puts "Image directory: #{image_dir}"
+puts "Output file: #{output_file}"
+puts "=" * 50
+puts ""
+
+generate_manifest(image_dir, output_file)
+puts "\nDone! Upload both manifest.yaml and the images directory to GitHub."
