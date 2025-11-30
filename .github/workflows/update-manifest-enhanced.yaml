@@ -170,19 +170,27 @@ Files changed:"
         with:
           script: |
             const fs = require('fs');
+            const total = '${{ steps.count.outputs.total }}';
+            const roomUids = '${{ steps.count.outputs.room_uids }}';
+            const locations = '${{ steps.count.outputs.locations }}';
+            const errors = parseInt('${{ steps.validate.outputs.errors }}');
+            const warnings = parseInt('${{ steps.validate.outputs.warnings }}');
+            const changed = '${{ steps.check_changes.outputs.changed }}';
+            
             let comment = '## 🖼️ Image Manifest Update\n\n';
+            comment += '### Statistics\n';
+            comment += `- **Total images**: ${total}\n`;
+            comment += `- **Room UID images**: ${roomUids}\n`;
+            comment += `- **Location images**: ${locations}\n\n`;
             
-            comment += `### Statistics\n`;
-            comment += `- **Total images**: ${{ steps.count.outputs.total }}\n`;
-            comment += `- **Room UID images**: ${{ steps.count.outputs.room_uids }}\n`;
-            comment += `- **Location images**: ${{ steps.count.outputs.locations }}\n\n`;
-            
-            if (${{ steps.validate.outputs.errors }} > 0 || ${{ steps.validate.outputs.warnings }} > 0) {
-              comment += fs.readFileSync('validation_report.md', 'utf8');
-              comment += '\n\n';
+            if (errors > 0 || warnings > 0) {
+              if (fs.existsSync('validation_report.md')) {
+                comment += fs.readFileSync('validation_report.md', 'utf8');
+                comment += '\n\n';
+              }
             }
             
-            if ('${{ steps.check_changes.outputs.changed }}' === 'true') {
+            if (changed === 'true') {
               comment += '✅ Manifest will be automatically updated when this PR is merged.\n';
             } else {
               comment += 'ℹ️ No manifest changes needed.\n';
