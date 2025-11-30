@@ -1,0 +1,583 @@
+=begin
+  This script will create a new window and load images built for the Visualizer script
+  for different locations across Gemstone IV.
+
+  Add to your autostart with the following command:
+
+  ;autostart add visualizer
+
+  or Global with
+
+  ;autostart add --global visualizer
+
+         author: Selfane
+   contributors: Tysong
+            art: Alosaka, Oro
+        version: 0.10.0
+
+  Changelog:
+  0.10.0  - Complete refactor with namespace, YAML config, modern Ruby practices
+  0.09.2  - Rubocop cleanup, File.join usage, failsafe upon no Visualizer folder created
+  0.09.1  - Proper Art credit
+  0.09    - Initial Script Upload
+=end
+
+require 'yaml'
+require 'fileutils'
+require 'digest'
+require 'open-uri'
+require 'net/http'
+
+module Visualizer
+  # GitHub repository configuration
+  GITHUB_REPO = 'mrhoribu/visualizer'
+  GITHUB_BRANCH = 'main'
+  MANIFEST_URL = "https://raw.githubusercontent.com/#{GITHUB_REPO}/#{GITHUB_BRANCH}/manifest.yaml"
+  # Validates file checksums against manifest
+  class ChecksumValidator
+    def self.calculate_checksum(file_path)
+      return nil unless File.exist?(file_path)
+      Digest::SHA256.file(file_path).hexdigest
+    end
+
+    def self.validate?(file_path, expected_checksum)
+      return false if expected_checksum.nil?
+      calculate_checksum(file_path) == expected_checksum
+    end
+  end
+
+  # Manages asset downloads and updates from GitHub
+  class AssetManager
+    VISUALIZER_DIR = File.join(SCRIPT_DIR, 'Visualizer')
+    MANIFEST_PATH = File.join(VISUALIZER_DIR, 'manifest.yaml')
+    MANIFEST_CACHE_HOURS = 24
+
+    attr_reader :manifest
+
+    def initialize
+      @manifest = {}
+      @base_url = "https://raw.githubusercontent.com/#{GITHUB_REPO}/#{GITHUB_BRANCH}/images"
+      ensure_directory_exists
+    end
+
+    def check_and_update_assets
+      respond 'Checking for asset updates...'
+      
+      unless download_manifest
+        respond 'Could not download manifest. Using local assets.'
+        return load_local_manifest
+      end
+
+      missing_assets = find_missing_assets
+      outdated_assets = find_outdated_assets
+
+      if missing_assets.empty? && outdated_assets.empty?
+        respond 'All assets are up to date!'
+        return true
+      end
+
+      download_assets(missing_assets + outdated_assets)
+    end
+
+    def download_manifest
+      return false unless manifest_needs_update?
+
+      respond "Downloading manifest from #{MANIFEST_URL}..."
+      
+      URI.open(MANIFEST_URL, read_timeout: 10) do |remote_file|
+        content = remote_file.read
+        @manifest = YAML.safe_load(content) || {}
+        File.write(MANIFEST_PATH, content)
+        respond "Manifest downloaded successfully (#{@manifest.size} assets listed)"
+        return true
+      end
+    rescue StandardError => e
+      respond "Error downloading manifest: #{e.message}"
+      load_local_manifest
+      false
+    end
+
+    def load_local_manifest
+      return false unless File.exist?(MANIFEST_PATH)
+
+      @manifest = YAML.load_file(MANIFEST_PATH) || {}
+      respond "Loaded local manifest (#{@manifest.size} assets)"
+      true
+    rescue StandardError => e
+      respond "Error loading local manifest: #{e.message}"
+      @manifest = {}
+      false
+    end
+
+    private
+
+    def ensure_directory_exists
+      FileUtils.mkdir_p(VISUALIZER_DIR) unless File.exist?(VISUALIZER_DIR)
+    end
+
+    def manifest_needs_update?
+      return true unless File.exist?(MANIFEST_PATH)
+
+      # Check if manifest is older than cache duration
+      age_hours = (Time.now - File.mtime(MANIFEST_PATH)) / 3600
+      age_hours >= MANIFEST_CACHE_HOURS
+    end
+
+    def find_missing_assets
+      missing = []
+      @manifest.each do |filename, data|
+        file_path = File.join(VISUALIZER_DIR, filename)
+        missing << { filename: filename, data: data } unless File.exist?(file_path)
+      end
+      respond "Found #{missing.size} missing assets" unless missing.empty?
+      missing
+    end
+
+    def find_outdated_assets
+      outdated = []
+      @manifest.each do |filename, data|
+        file_path = File.join(VISUALIZER_DIR, filename)
+        next unless File.exist?(file_path)
+
+        expected_checksum = data['checksum'] || data['sha256']
+        unless ChecksumValidator.validate?(file_path, expected_checksum)
+          outdated << { filename: filename, data: data }
+        end
+      end
+      respond "Found #{outdated.size} outdated assets" unless outdated.empty?
+      outdated
+    end
+
+    def download_assets(assets)
+      return true if assets.empty?
+
+      respond "Downloading #{assets.size} asset(s)..."
+      success_count = 0
+      
+      assets.each_with_index do |asset, index|
+        if download_asset(asset[:filename], asset[:data])
+          success_count += 1
+          respond "  [#{index + 1}/#{assets.size}] Downloaded: #{asset[:filename]}"
+        else
+          respond "  [#{index + 1}/#{assets.size}] Failed: #{asset[:filename]}"
+        end
+      end
+
+      respond "Successfully downloaded #{success_count}/#{assets.size} assets"
+      success_count == assets.size
+    end
+
+    def download_asset(filename, data)
+      url = "#{@base_url}/#{filename}"
+      file_path = File.join(VISUALIZER_DIR, filename)
+      
+      URI.open(url, read_timeout: 30) do |remote_file|
+        File.binwrite(file_path, remote_file.read)
+        
+        # Verify checksum after download
+        expected_checksum = data['checksum'] || data['sha256']
+        if expected_checksum && !ChecksumValidator.validate?(file_path, expected_checksum)
+          File.delete(file_path) if File.exist?(file_path)
+          respond "    Checksum mismatch for #{filename}"
+          return false
+        end
+        
+        return true
+      end
+    rescue StandardError => e
+      respond "    Error downloading #{filename}: #{e.message}"
+      false
+    end
+  end
+
+  # Configuration management for the Visualizer script
+  class Config
+    DEFAULT_SETTINGS = {
+      'window_position' => [500, 500],
+      'window_width' => 500,
+      'window_height' => 500,
+      'auto_update_assets' => true,
+      'last_asset_check' => nil
+    }.freeze
+
+    attr_accessor :window_position, :window_width, :window_height, 
+                  :auto_update_assets, :last_asset_check
+
+    def initialize
+      @config_path = File.join(DATA_DIR, XMLData.game, XMLData.name, 'visualizer_config.yaml')
+      load_config
+    end
+
+    def load_config
+      if File.exist?(@config_path)
+        begin
+          config = YAML.load_file(@config_path) || {}
+          @window_position = config['window_position'] || DEFAULT_SETTINGS['window_position']
+          @window_width = config['window_width'] || DEFAULT_SETTINGS['window_width']
+          @window_height = config['window_height'] || DEFAULT_SETTINGS['window_height']
+          @auto_update_assets = config.fetch('auto_update_assets', DEFAULT_SETTINGS['auto_update_assets'])
+          @last_asset_check = config['last_asset_check']
+        rescue StandardError => e
+          respond "Error loading config: #{e.message}"
+          load_defaults
+        end
+      else
+        load_defaults
+      end
+    end
+
+    def save_config
+      FileUtils.mkdir_p(File.dirname(@config_path))
+      
+      config_data = {
+        'window_position' => @window_position,
+        'window_width' => @window_width,
+        'window_height' => @window_height,
+        'auto_update_assets' => @auto_update_assets,
+        'last_asset_check' => @last_asset_check
+      }
+
+      File.write(@config_path, YAML.dump(config_data))
+      echo "Config saved to #{@config_path}"
+    rescue StandardError => e
+      respond "Error saving config: #{e.message}"
+    end
+
+    def update_last_asset_check
+      @last_asset_check = Time.now
+    end
+
+    private
+
+    def load_defaults
+      @window_position = DEFAULT_SETTINGS['window_position'].dup
+      @window_width = DEFAULT_SETTINGS['window_width']
+      @window_height = DEFAULT_SETTINGS['window_height']
+      @auto_update_assets = DEFAULT_SETTINGS['auto_update_assets']
+      @last_asset_check = DEFAULT_SETTINGS['last_asset_check']
+    end
+  end
+
+  # Manages image paths and loading for the visualizer
+  class ImageManager
+    VISUALIZER_DIR = File.join(SCRIPT_DIR, 'Visualizer')
+    NULL_IMAGE = File.join(VISUALIZER_DIR, 'null.png')
+
+    def self.check_image_library
+      if File.exist?(VISUALIZER_DIR)
+        respond "Visualizer directory found: #{VISUALIZER_DIR}"
+        return true
+      end
+
+      respond ''
+      respond 'Visualizer directory not found. Creating it now...'
+      FileUtils.mkdir_p(VISUALIZER_DIR)
+      respond "Created: #{VISUALIZER_DIR}"
+      respond ''
+      respond 'Assets will be downloaded automatically from GitHub.'
+      respond ''
+      true
+    end
+
+    def self.image_path_for_room(room)
+      # Try room UID first
+      uid_path = File.join(VISUALIZER_DIR, "u#{room.uid.max}.png")
+      return uid_path if File.exist?(uid_path)
+
+      # Try location name
+      location_path = File.join(VISUALIZER_DIR, "#{room.location}.png")
+      return location_path if File.exist?(location_path)
+
+      # Fall back to null image
+      NULL_IMAGE
+    end
+
+    def self.image_exists?(path)
+      File.exist?(path) && File.file?(path)
+    end
+
+    def self.count_images
+      return 0 unless File.exist?(VISUALIZER_DIR)
+      Dir.glob(File.join(VISUALIZER_DIR, '*.png')).count
+    end
+  end
+
+  # Handles the GTK window and image display
+  class WindowManager
+    attr_reader :window, :exit_requested
+
+    def initialize(config)
+      @config = config
+      @exit_requested = false
+      @window = nil
+      @image = nil
+      @layout = nil
+      @scroller = nil
+      @current_image_path = nil
+      @current_width = nil
+      @current_height = nil
+      @current_room_uid = nil
+    end
+
+    def create_window
+      Gtk.queue { setup_window }
+    end
+
+    def load_image_for_room(room)
+      @current_image_path = ImageManager.image_path_for_room(room)
+      @current_room_uid = room.uid.max
+      update_image_display
+    end
+
+    def update_on_resize
+      return unless window_size_changed?
+
+      @config.window_width = @window.allocation.width
+      @config.window_height = @window.allocation.height
+      
+      update_image_display if @current_width && @current_height
+    end
+
+    def cleanup
+      capture_window_state
+      sleep 0.01 while @config.window_height.nil?
+      
+      Gtk.queue { @window.destroy }
+      @config.save_config
+    end
+
+    private
+
+    def setup_window
+      @window = Gtk::Window.new
+      @window.title = window_title_for_room(Room.current)
+      @window.set_icon(@default_icon)
+      @window.signal_connect('delete_event') { @exit_requested = true }
+      @window.keep_above = true
+      
+      setup_scroller
+      position_and_size_window
+      
+      load_initial_image
+      @window.show_all
+    end
+
+    def setup_scroller
+      @scroller = Gtk::ScrolledWindow.new
+      @scroller.border_width = 0
+      @scroller.set_policy(:automatic, :always)
+      @window.add(@scroller)
+
+      @layout = Gtk::Layout.new
+      @scroller.add(@layout)
+    end
+
+    def position_and_size_window
+      # Ensure minimum window dimensions
+      @config.window_height = [@config.window_height, 100].max
+      @config.window_width = [@config.window_width, 100].max
+      
+      @window.resize(@config.window_width, @config.window_height)
+
+      # Constrain position to screen bounds
+      x_pos = [[0, @config.window_position[0].to_i].max,
+               (Gdk::Screen.default.width - @config.window_width)].min
+      y_pos = [[0, @config.window_position[1].to_i].max,
+               Gdk::Screen.default.height].min
+      
+      @window.move(x_pos, y_pos)
+    end
+
+    def load_initial_image
+      @current_image_path = ImageManager.image_path_for_room(Room.current)
+      @current_room_uid = Room.current.uid.max
+      
+      return unless ImageManager.image_exists?(@current_image_path)
+
+      load_and_scale_image
+    end
+
+    def update_image_display
+      return unless @window
+
+      unless ImageManager.image_exists?(@current_image_path)
+        remove_current_image
+        @window.show_all
+        return
+      end
+
+      Gtk.queue do
+        @window.title = window_title_for_room(Room.current)
+        load_and_scale_image
+        @window.show_all
+      end
+    rescue StandardError => e
+      respond "Error updating image: #{e.message}"
+      remove_current_image
+    end
+
+    def load_and_scale_image
+      _format, width, height = GdkPixbuf::Pixbuf.get_file_info(@current_image_path)
+      @current_width = width
+      @current_height = height
+
+      scale = calculate_scale(width)
+      scaled_width = (width * scale).to_i
+      scaled_height = (height * scale).to_i
+
+      @layout.set_size(scaled_width, scaled_height)
+      
+      remove_current_image
+      
+      @image = Gtk::Image.new
+      pixbuf = GdkPixbuf::Pixbuf.new(file: @current_image_path)
+      @image.set_pixbuf(pixbuf.scale(scaled_width, scaled_height))
+      @layout.put(@image, 0, 0)
+    end
+
+    def calculate_scale(image_width)
+      scale = @config.window_width.to_f / [image_width, 1].max
+      [scale, 1].min
+    end
+
+    def remove_current_image
+      @layout.remove(@image) if @image
+      @image = nil
+    end
+
+    def window_size_changed?
+      @window &&
+        @window.allocation.height &&
+        @window.allocation.width &&
+        (@window.allocation.height != @config.window_height ||
+         @window.allocation.width != @config.window_width)
+    end
+
+    def window_title_for_room(room)
+      "Visualizer - #{room.title} - u#{room.uid[0]}"
+    end
+
+    def capture_window_state
+      Gtk.queue do
+        position = @window.position
+        @config.window_position = position if valid_position?(position)
+        @config.window_width = @window.allocation.width if valid_dimension?(@window.allocation.width)
+        @config.window_height = @window.allocation.height if valid_dimension?(@window.allocation.height)
+      end
+    end
+
+    def valid_position?(position)
+      position.is_a?(Array) && position[0].to_i > 0 && position[1].to_i > 0
+    end
+
+    def valid_dimension?(dimension)
+      dimension.is_a?(Integer) && dimension > 100
+    end
+  end
+
+  # Main application controller
+  class Application
+    POLL_INTERVAL = 0.5
+    ASSET_CHECK_INTERVAL_HOURS = 24
+
+    def self.run
+      # Parse command line arguments
+      if script.vars[1] == 'update'
+        force_update_assets
+        return
+      elsif script.vars[1] == 'help'
+        show_help
+        return
+      end
+
+      new.start
+    end
+
+    def self.force_update_assets
+      ImageManager.check_image_library
+      asset_manager = AssetManager.new
+      asset_manager.check_and_update_assets
+      respond "Asset update complete!"
+    end
+
+    def self.show_help
+      respond ''
+      respond 'Visualizer - Room image display for Gemstone IV'
+      respond ''
+      respond 'Usage:'
+      respond '  ;visualizer              - Start the visualizer'
+      respond '  ;visualizer update       - Force asset update from GitHub'
+      respond '  ;visualizer help         - Show this help message'
+      respond ''
+      respond 'Configuration:'
+      respond "  Config file: #{File.join(DATA_DIR, XMLData.game, XMLData.name, 'visualizer_config.yaml')}"
+      respond "  Asset directory: #{ImageManager::VISUALIZER_DIR}"
+      respond ''
+      respond 'GitHub Repository:'
+      respond "  #{GITHUB_REPO}"
+      respond ''
+    end
+
+    def initialize
+      @config = Config.new
+      @window_manager = WindowManager.new(@config)
+      @last_room_uid = Room.current.uid.max
+      @asset_manager = AssetManager.new
+    end
+
+    def start
+      return unless ImageManager.check_image_library
+
+      # Check and update assets if enabled
+      check_assets if @config.auto_update_assets
+
+      @window_manager.create_window
+      @window_manager.load_image_for_room(Room.current)
+
+      setup_cleanup_hook
+      main_loop
+    end
+
+    private
+
+    def check_assets
+      return unless should_check_assets?
+
+      respond 'Performing automatic asset check...'
+      @asset_manager.check_and_update_assets
+      @config.update_last_asset_check
+      @config.save_config
+    end
+
+    def should_check_assets?
+      return true if @config.last_asset_check.nil?
+
+      hours_since_check = (Time.now - @config.last_asset_check) / 3600
+      hours_since_check >= ASSET_CHECK_INTERVAL_HOURS
+    end
+
+    def main_loop
+      until @window_manager.exit_requested
+        @window_manager.update_on_resize
+        check_room_change
+        sleep POLL_INTERVAL
+      end
+    end
+
+    def check_room_change
+      current_room_uid = Room.current.uid.max
+      return if current_room_uid == @last_room_uid
+
+      # Don't update image by UID if go2 is running (traveling)
+      @last_room_uid = current_room_uid unless running?('go2')
+      @window_manager.load_image_for_room(Room.current)
+    end
+
+    def setup_cleanup_hook
+      before_dying { @window_manager.cleanup }
+    end
+  end
+end
+
+# Start the application
+Visualizer::Application.run
