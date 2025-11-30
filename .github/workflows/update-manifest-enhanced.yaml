@@ -1,0 +1,228 @@
+name: Update and Validate Image Manifest
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'images/**/*.png'
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-manifest:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      
+      - name: Install dependencies
+        run: |
+          gem install mini_magick
+      
+      - name: Validate images
+        id: validate
+        run: |
+          echo "## Image Validation Report" > validation_report.md
+          echo "" >> validation_report.md
+          
+          ERRORS=0
+          WARNINGS=0
+          
+          for img in images/*.png; do
+            if [ ! -f "$img" ]; then
+              continue
+            fi
+            
+            filename=$(basename "$img")
+            
+            # Check file size
+            size=$(stat -f%z "$img" 2>/dev/null || stat -c%s "$img" 2>/dev/null)
+            
+            if [ $size -gt 5242880 ]; then  # 5MB
+              echo "⚠️ **Warning**: \`$filename\` is larger than 5MB ($((size / 1024 / 1024))MB)" >> validation_report.md
+              WARNINGS=$((WARNINGS + 1))
+            fi
+            
+            # Check if it's a valid PNG
+            if ! file "$img" | grep -q "PNG image data"; then
+              echo "❌ **Error**: \`$filename\` is not a valid PNG file" >> validation_report.md
+              ERRORS=$((ERRORS + 1))
+            fi
+          done
+          
+          echo "" >> validation_report.md
+          echo "**Summary**: $ERRORS error(s), $WARNINGS warning(s)" >> validation_report.md
+          
+          cat validation_report.md
+          
+          echo "errors=$ERRORS" >> $GITHUB_OUTPUT
+          echo "warnings=$WARNINGS" >> $GITHUB_OUTPUT
+      
+      - name: Count images
+        id: count
+        run: |
+          TOTAL=$(find images -name "*.png" -type f | wc -l)
+          ROOM_UIDS=$(find images -name "u*.png" -type f | wc -l)
+          LOCATIONS=$(find images -name "*.png" -type f ! -name "u*.png" ! -name "null.png" | wc -l)
+          
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "room_uids=$ROOM_UIDS" >> $GITHUB_OUTPUT
+          echo "locations=$LOCATIONS" >> $GITHUB_OUTPUT
+          
+          echo "📊 Image Statistics:"
+          echo "  - Total images: $TOTAL"
+          echo "  - Room UID images: $ROOM_UIDS"
+          echo "  - Location images: $LOCATIONS"
+      
+      - name: Generate manifest
+        run: |
+          echo "Generating manifest.yaml..."
+          ruby generate_manifest.rb images manifest.yaml
+      
+      - name: Verify manifest
+        run: |
+          if [ ! -f manifest.yaml ]; then
+            echo "❌ Error: manifest.yaml was not generated"
+            exit 1
+          fi
+          
+          # Check if manifest is valid YAML
+          ruby -r yaml -e "YAML.load_file('manifest.yaml')" || exit 1
+          
+          echo "✅ Manifest is valid YAML"
+      
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if git diff --quiet manifest.yaml; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No changes to manifest.yaml"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Manifest has been updated"
+            
+            # Show the diff
+            echo "Changes:"
+            git diff manifest.yaml | head -50
+          fi
+      
+      - name: Generate commit message
+        if: steps.check_changes.outputs.changed == 'true'
+        id: commit_msg
+        run: |
+          # Get list of changed, added, and deleted images
+          ADDED=$(git diff --name-only --diff-filter=A HEAD~1 HEAD -- images/ | sed 's|images/||' | wc -l)
+          MODIFIED=$(git diff --name-only --diff-filter=M HEAD~1 HEAD -- images/ | sed 's|images/||' | wc -l)
+          DELETED=$(git diff --name-only --diff-filter=D HEAD~1 HEAD -- images/ | sed 's|images/||' | wc -l)
+          
+          CHANGED_IMAGES=$(git diff --name-only HEAD~1 HEAD -- images/ | sed 's|images/||' | head -10)
+          
+          MESSAGE="chore: update manifest.yaml
+
+Image changes:
+- Added: $ADDED
+- Modified: $MODIFIED
+- Deleted: $DELETED
+- Total images: ${{ steps.count.outputs.total }}
+
+Files changed:"
+          
+          echo "$CHANGED_IMAGES" | while read -r file; do
+            if [ ! -z "$file" ]; then
+              MESSAGE="$MESSAGE
+- $file"
+            fi
+          done
+          
+          # Save to file to preserve newlines
+          echo "$MESSAGE" > commit_message.txt
+      
+      - name: Commit and push changes
+        if: steps.check_changes.outputs.changed == 'true' && github.event_name == 'push'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add manifest.yaml
+          
+          if [ -f commit_message.txt ]; then
+            git commit -F commit_message.txt
+          else
+            git commit -m "chore: update manifest.yaml"
+          fi
+          
+          git push
+      
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let comment = '## 🖼️ Image Manifest Update\n\n';
+            
+            comment += `### Statistics\n`;
+            comment += `- **Total images**: ${{ steps.count.outputs.total }}\n`;
+            comment += `- **Room UID images**: ${{ steps.count.outputs.room_uids }}\n`;
+            comment += `- **Location images**: ${{ steps.count.outputs.locations }}\n\n`;
+            
+            if (${{ steps.validate.outputs.errors }} > 0 || ${{ steps.validate.outputs.warnings }} > 0) {
+              comment += fs.readFileSync('validation_report.md', 'utf8');
+              comment += '\n\n';
+            }
+            
+            if ('${{ steps.check_changes.outputs.changed }}' === 'true') {
+              comment += '✅ Manifest will be automatically updated when this PR is merged.\n';
+            } else {
+              comment += 'ℹ️ No manifest changes needed.\n';
+            }
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+      
+      - name: Upload manifest artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest
+          path: manifest.yaml
+          retention-days: 30
+      
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## 📋 Manifest Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Image Statistics" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total images**: ${{ steps.count.outputs.total }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Room UID images**: ${{ steps.count.outputs.room_uids }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Location images**: ${{ steps.count.outputs.locations }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f validation_report.md ]; then
+            cat validation_report.md >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ steps.check_changes.outputs.changed }}" == "true" ]; then
+            echo "### ✅ Manifest Updated" >> $GITHUB_STEP_SUMMARY
+            echo "The manifest.yaml file has been updated and committed." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ℹ️ No Changes" >> $GITHUB_STEP_SUMMARY
+            echo "No changes to manifest.yaml were needed." >> $GITHUB_STEP_SUMMARY
+          fi
