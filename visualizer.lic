@@ -27,6 +27,11 @@ require 'fileutils'
 require 'digest'
 require 'open-uri'
 require 'net/http'
+require 'uri'
+require 'zlib'
+require 'rubygems/package'
+require 'openssl'
+require 'time'
 
 module Visualizer
   # GitHub repository configuration
@@ -68,6 +73,13 @@ module Visualizer
         return load_local_manifest
       end
 
+      # Check if this is a new installation (no images yet)
+      current_image_count = Dir.glob(File.join(VISUALIZER_DIR, '*.png')).count
+      if current_image_count == 0 && @manifest.size > 100
+        respond "New installation detected. Downloading repository archive for faster initial setup..."
+        return bulk_download_repository if attempt_bulk_download
+      end
+
       missing_assets = find_missing_assets
       outdated_assets = find_outdated_assets
 
@@ -79,28 +91,140 @@ module Visualizer
       download_assets(missing_assets + outdated_assets)
     end
 
+    def attempt_bulk_download
+      # Download the repository as a tar.gz file for faster initial setup
+      tar_url = "https://github.com/#{GITHUB_REPO}/archive/refs/heads/#{GITHUB_BRANCH}.tar.gz"
+      temp_tar = File.join(VISUALIZER_DIR, 'temp_repo.tar.gz')
+      
+      respond "Downloading repository archive..."
+      
+      begin
+        # Try with SSL verification
+        URI.open(tar_url, ssl_verify_mode: OpenSSL::SSL::VERIFY_PEER, read_timeout: 60) do |remote_file|
+          File.binwrite(temp_tar, remote_file.read)
+        end
+      rescue OpenSSL::SSL::SSLError
+        respond "SSL verification failed, retrying without verification..."
+        URI.open(tar_url, ssl_verify_mode: OpenSSL::SSL::VERIFY_NONE, read_timeout: 60) do |remote_file|
+          File.binwrite(temp_tar, remote_file.read)
+        end
+      end
+      
+      respond "Extracting images from archive..."
+      extract_images_from_tar(temp_tar)
+      
+      File.delete(temp_tar) if File.exist?(temp_tar)
+      
+      respond "Bulk download complete! Verifying checksums..."
+      verify_all_checksums
+      
+      true
+    rescue StandardError => e
+      respond "Bulk download failed: #{e.message}"
+      respond "Falling back to individual file downloads..."
+      File.delete(temp_tar) if File.exist?(temp_tar)
+      false
+    end
+
+    def extract_images_from_tar(tar_path)
+      extracted_count = 0
+      
+      # Open the gzipped tar file
+      Zlib::GzipReader.open(tar_path) do |gz|
+        Gem::Package::TarReader.new(gz) do |tar|
+          tar.each do |entry|
+            # GitHub archives have structure: repo-branch/images/filename.png
+            next unless entry.full_name.include?('/images/') && entry.full_name.end_with?('.png')
+            next unless entry.file?
+            
+            filename = File.basename(entry.full_name)
+            target_path = File.join(VISUALIZER_DIR, filename)
+            
+            # Extract the file
+            File.open(target_path, 'wb') do |f|
+              f.write(entry.read)
+            end
+            
+            extracted_count += 1
+          end
+        end
+      end
+      
+      respond "Extracted #{extracted_count} images from archive"
+    end
+
+    def verify_all_checksums
+      invalid_count = 0
+      
+      @manifest.each do |filename, data|
+        file_path = File.join(VISUALIZER_DIR, filename)
+        next unless File.exist?(file_path)
+        
+        expected_checksum = data['checksum'] || data['sha256']
+        next unless expected_checksum
+        
+        unless ChecksumValidator.validate?(file_path, expected_checksum)
+          respond "  Checksum mismatch for #{filename}, will re-download"
+          File.delete(file_path)
+          invalid_count += 1
+        end
+      end
+      
+      if invalid_count > 0
+        respond "Re-downloading #{invalid_count} files with checksum mismatches..."
+        missing = find_missing_assets
+        download_assets(missing)
+      else
+        respond "All checksums verified successfully!"
+      end
+    end
+
+    def bulk_download_repository
+      attempt_bulk_download
+    end
+
     def download_manifest
       return false unless manifest_needs_update?
 
       respond "Downloading manifest from #{MANIFEST_URL}..."
       
-      URI.open(MANIFEST_URL, read_timeout: 10) do |remote_file|
-        content = remote_file.read
-        @manifest = YAML.safe_load(content) || {}
-        File.write(MANIFEST_PATH, content)
-        respond "Manifest downloaded successfully (#{@manifest.size} assets listed)"
-        return true
+      begin
+        # Try with OpenSSL verification first
+        URI.open(MANIFEST_URL, ssl_verify_mode: OpenSSL::SSL::VERIFY_PEER, read_timeout: 10) do |remote_file|
+          content = remote_file.read
+          @manifest = YAML.safe_load(content, permitted_classes: [Symbol]) || {}
+          File.write(MANIFEST_PATH, content)
+          respond "Manifest downloaded successfully (#{@manifest.size} assets listed)"
+          return true
+        end
+      rescue OpenSSL::SSL::SSLError => e
+        respond "SSL verification failed, retrying without verification..."
+        # Fall back to no SSL verification (for systems with cert issues)
+        begin
+          URI.open(MANIFEST_URL, ssl_verify_mode: OpenSSL::SSL::VERIFY_NONE, read_timeout: 10) do |remote_file|
+            content = remote_file.read
+            @manifest = YAML.safe_load(content, permitted_classes: [Symbol]) || {}
+            File.write(MANIFEST_PATH, content)
+            respond "Manifest downloaded successfully (#{@manifest.size} assets listed)"
+            return true
+          end
+        rescue StandardError => e2
+          respond "Error downloading manifest (no SSL): #{e2.message}"
+          load_local_manifest
+          return false
+        end
+      rescue StandardError => e
+        respond "Error downloading manifest: #{e.message}"
+        respond "Error class: #{e.class}"
+        load_local_manifest
+        return false
       end
-    rescue StandardError => e
-      respond "Error downloading manifest: #{e.message}"
-      load_local_manifest
-      false
     end
 
     def load_local_manifest
       return false unless File.exist?(MANIFEST_PATH)
 
-      @manifest = YAML.load_file(MANIFEST_PATH) || {}
+      @manifest = YAML.safe_load(File.read(MANIFEST_PATH), permitted_classes: [Symbol]) || {}
       respond "Loaded local manifest (#{@manifest.size} assets)"
       true
     rescue StandardError => e
@@ -151,40 +275,78 @@ module Visualizer
     def download_assets(assets)
       return true if assets.empty?
 
-      respond "Downloading #{assets.size} asset(s)..."
+      total = assets.size
+      respond "Downloading #{total} asset(s)..."
+      respond "This may take a while for large downloads. Progress updates every 10 files."
+      
       success_count = 0
+      failed_assets = []
       
       assets.each_with_index do |asset, index|
         if download_asset(asset[:filename], asset[:data])
           success_count += 1
-          respond "  [#{index + 1}/#{assets.size}] Downloaded: #{asset[:filename]}"
+          # Show progress every 10 files or at completion
+          if (index + 1) % 10 == 0 || (index + 1) == total
+            percentage = ((index + 1).to_f / total * 100).round(1)
+            respond "  Progress: #{index + 1}/#{total} (#{percentage}%) - #{success_count} successful"
+          end
         else
-          respond "  [#{index + 1}/#{assets.size}] Failed: #{asset[:filename]}"
+          failed_assets << asset[:filename]
         end
       end
 
-      respond "Successfully downloaded #{success_count}/#{assets.size} assets"
-      success_count == assets.size
+      respond "Download complete: #{success_count}/#{total} assets successfully downloaded"
+      
+      unless failed_assets.empty?
+        respond "Failed downloads (#{failed_assets.size}):"
+        failed_assets.first(10).each { |name| respond "  - #{name}" }
+        respond "  ... and #{failed_assets.size - 10} more" if failed_assets.size > 10
+      end
+      
+      success_count == total
     end
 
-    def download_asset(filename, data)
-      url = "#{@base_url}/#{filename}"
+    def download_asset(filename, data, retry_count = 0)
+      # URL-encode the filename for the download URL
+      encoded_filename = URI.encode_www_form_component(filename)
+      url = "#{@base_url}/#{encoded_filename}"
       file_path = File.join(VISUALIZER_DIR, filename)
       
-      URI.open(url, read_timeout: 30) do |remote_file|
-        File.binwrite(file_path, remote_file.read)
+      begin
+        # Try with SSL verification
+        URI.open(url, ssl_verify_mode: OpenSSL::SSL::VERIFY_PEER, read_timeout: 30) do |remote_file|
+          File.binwrite(file_path, remote_file.read)
+        end
+      rescue OpenSSL::SSL::SSLError
+        # Retry without SSL verification
+        URI.open(url, ssl_verify_mode: OpenSSL::SSL::VERIFY_NONE, read_timeout: 30) do |remote_file|
+          File.binwrite(file_path, remote_file.read)
+        end
+      end
+      
+      # Verify checksum after download
+      expected_checksum = data['checksum'] || data['sha256']
+      if expected_checksum && !ChecksumValidator.validate?(file_path, expected_checksum)
+        File.delete(file_path) if File.exist?(file_path)
         
-        # Verify checksum after download
-        expected_checksum = data['checksum'] || data['sha256']
-        if expected_checksum && !ChecksumValidator.validate?(file_path, expected_checksum)
-          File.delete(file_path) if File.exist?(file_path)
-          respond "    Checksum mismatch for #{filename}"
-          return false
+        # Retry once if checksum fails
+        if retry_count < 1
+          sleep 0.5
+          return download_asset(filename, data, retry_count + 1)
         end
         
-        return true
+        respond "    Checksum mismatch for #{filename} after retry"
+        return false
       end
+      
+      return true
     rescue StandardError => e
+      # Retry once on network errors
+      if retry_count < 1
+        sleep 1
+        return download_asset(filename, data, retry_count + 1)
+      end
+      
       respond "    Error downloading #{filename}: #{e.message}"
       false
     end
@@ -211,12 +373,22 @@ module Visualizer
     def load_config
       if File.exist?(@config_path)
         begin
-          config = YAML.load_file(@config_path) || {}
+          config = YAML.load_file(@config_path, permitted_classes: [Time]) || {}
           @window_position = config['window_position'] || DEFAULT_SETTINGS['window_position']
           @window_width = config['window_width'] || DEFAULT_SETTINGS['window_width']
           @window_height = config['window_height'] || DEFAULT_SETTINGS['window_height']
           @auto_update_assets = config.fetch('auto_update_assets', DEFAULT_SETTINGS['auto_update_assets'])
-          @last_asset_check = config['last_asset_check']
+          
+          # Handle Time object or convert from string
+          last_check = config['last_asset_check']
+          @last_asset_check = case last_check
+                              when Time
+                                last_check
+                              when String
+                                Time.parse(last_check) rescue nil
+                              else
+                                nil
+                              end
         rescue StandardError => e
           respond "Error loading config: #{e.message}"
           load_defaults
@@ -234,7 +406,7 @@ module Visualizer
         'window_width' => @window_width,
         'window_height' => @window_height,
         'auto_update_assets' => @auto_update_assets,
-        'last_asset_check' => @last_asset_check
+        'last_asset_check' => @last_asset_check&.iso8601  # Save as ISO string
       }
 
       File.write(@config_path, YAML.dump(config_data))
@@ -482,10 +654,10 @@ module Visualizer
 
     def self.run
       # Parse command line arguments
-      if script.vars[1] == 'update'
+      if Script.current.vars[1] == 'update'
         force_update_assets
         return
-      elsif script.vars[1] == 'help'
+      elsif Script.current.vars[1] == 'help'
         show_help
         return
       end
