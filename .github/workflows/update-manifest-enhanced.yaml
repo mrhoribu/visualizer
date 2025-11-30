@@ -129,25 +129,23 @@ jobs:
           
           CHANGED_IMAGES=$(git diff --name-only HEAD~1 HEAD -- images/ | sed 's|images/||' | head -10)
           
-          MESSAGE="chore: update manifest.yaml
-
-Image changes:
-- Added: $ADDED
-- Modified: $MODIFIED
-- Deleted: $DELETED
-- Total images: ${{ steps.count.outputs.total }}
-
-Files changed:"
+          # Build commit message using echo to handle multiline properly
+          echo "chore: update manifest.yaml" > commit_message.txt
+          echo "" >> commit_message.txt
+          echo "Image changes:" >> commit_message.txt
+          echo "- Added: $ADDED" >> commit_message.txt
+          echo "- Modified: $MODIFIED" >> commit_message.txt
+          echo "- Deleted: $DELETED" >> commit_message.txt
+          echo "- Total images: ${{ steps.count.outputs.total }}" >> commit_message.txt
+          echo "" >> commit_message.txt
+          echo "Files changed:" >> commit_message.txt
           
+          # Add changed files to commit message
           echo "$CHANGED_IMAGES" | while read -r file; do
             if [ ! -z "$file" ]; then
-              MESSAGE="$MESSAGE
-- $file"
+              echo "- $file" >> commit_message.txt
             fi
           done
-          
-          # Save to file to preserve newlines
-          echo "$MESSAGE" > commit_message.txt
       
       - name: Commit and push changes
         if: steps.check_changes.outputs.changed == 'true' && github.event_name == 'push'
